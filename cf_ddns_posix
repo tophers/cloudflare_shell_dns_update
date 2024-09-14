@@ -1,0 +1,338 @@
+#!/bin/sh
+
+# Should be POSIX compatible, no bashisms
+
+############################################
+# Configuration Variables and Defaults     #
+############################################
+
+BASEDIR="$HOME/bin/cloudflare_ddns"
+CONFDIR="$BASEDIR/.ddns_configs"
+CONFIG_FILE="$CONFDIR/ddns.conf"
+LOG_FILE="$CONFDIR/ddns.log"
+MAX_LOG_SIZE=200 #Lines
+IPV4_SERVICE="http://ipv4.icanhazip.com"
+IPV6_SERVICE="http://ipv6.icanhazip.com"
+MAX_RETRIES=3
+RETRY_DELAY=5
+VERBOSE=false
+SPECIFIC_DOMAIN=""
+ADD_CONFIG=false
+
+############################################
+# End Configuration Variables and Defaults #
+############################################
+
+# Check all dependencies required are available
+check_dependencies() {
+  missing_dependencies=""
+  dependencies="sh curl jq tail mv mkdir chmod touch date sleep echo test"
+
+  for cmd in $dependencies; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing_dependencies="$missing_dependencies $cmd"
+    fi
+  done
+
+  if [ -n "$missing_dependencies" ]; then
+    echo "Error: The following dependencies are missing: $missing_dependencies"
+    exit 1
+  fi
+}
+check_dependencies
+
+# Ensure the base directory and log file exist and are secured
+mkdir -p "$CONFDIR"
+touch "$LOG_FILE"
+chmod 700 "$BASEDIR"
+chmod 600 "$CONFIG_FILE" "$LOG_FILE"
+
+#########################
+# Function Declarations
+#########################
+
+# Display help message
+show_help() {
+  echo "Usage: $0 [options]"
+  echo ""
+  echo "Options:"
+  echo "  -a            Add a new domain configuration"
+  echo "  -c CONFIG     Path to configuration file (default: $CONFIG_FILE)"
+  echo "  -d DOMAIN     Specify a domain to update or add"
+  echo "  -z ZONEID     Specify the Zone ID (used with -a)"
+  echo "  -t TOKEN      Specify the Cloudflare API Token (used with -a)"
+  echo "  -p            Enable proxying through Cloudflare (used with -a)"
+  echo "  -T TTL        Set TTL for the DNS record (used with -a), default is 60"
+  echo "  -v            Enable verbose output"
+  echo "  -h            Display this help message"
+  exit 1
+}
+
+# Log messages with timestamps and levels
+log() {
+  level="$1"
+  message="$2"
+  timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+  echo "$timestamp [$level] $message" >> "$LOG_FILE"
+  tail -n "$MAX_LOG_SIZE" "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+
+  if [ "$VERBOSE" = true ] || [ "$level" = "ERROR" ]; then
+    echo "$timestamp [$level] $message"
+  fi
+}
+
+# Retrieve current public IP address
+get_public_ip() {
+  ip_type="$1"
+  if [ "$ip_type" = "A" ]; then
+    ip_service="$IPV4_SERVICE"
+  else
+    ip_service="$IPV6_SERVICE"
+  fi
+
+  ip=$(curl -s --fail "$ip_service")
+  if [ -z "$ip" ]; then
+    log "ERROR" "Failed to retrieve current $ip_type IP address."
+    return 1
+  fi
+
+  echo "$ip"
+}
+update_domain() {
+  domain="$1"
+  cf_token="$2"
+  zoneid="$3"
+  proxied="$4"
+  ttl="$5"
+  record_types="A AAAA"
+
+  for record_type in $record_types; do
+    update_dns_record "$domain" "$cf_token" "$zoneid" "$record_type" "$proxied" "$ttl"
+  done
+}
+# Update DNS record for a single domain and record type
+update_dns_record() {
+  domain="$1"
+  cf_token="$2"
+  zoneid="$3"
+  record_type="$4"
+  proxied="$5"
+  ttl="$6"
+
+  if curr_ip=$(get_public_ip "$record_type"); then  
+    return 1
+  fi
+
+  ip_file="$CONFDIR/${domain}_${record_type}.ip"
+  last_ip=""
+  if [ -f "$ip_file" ]; then
+    last_ip=$(cat "$ip_file")
+  fi
+
+  if [ "$curr_ip" = "$last_ip" ]; then
+    log "INFO" "No update needed for $domain ($record_type). IP ($curr_ip) has not changed."
+    return 0
+  fi
+
+  log "INFO" "IP has changed for $domain ($record_type) from $last_ip to $curr_ip. Updating DNS record."
+
+  attempt=1
+  success=false
+  while [ "$attempt" -le "$MAX_RETRIES" ]; do
+    get_record=$(curl -s --fail -X GET "https://api.cloudflare.com/client/v4/zones/${zoneid}/dns_records?name=${domain}&type=${record_type}" \
+      -H "Authorization: Bearer ${cf_token}" \
+      -H "Content-Type: application/json")
+
+    if [ "$(echo "$get_record" | jq -r .success)" = "true" ]; then
+      success=true
+      break
+    else
+      log "WARN" "Attempt $attempt: Failed to retrieve DNS record for $domain ($record_type). Retrying in $RETRY_DELAY seconds..."
+      sleep "$RETRY_DELAY"
+      attempt=$((attempt + 1))
+    fi
+  done
+
+  if [ "$success" != "true" ]; then
+    log "ERROR" "All attempts failed to retrieve DNS record for $domain ($record_type)."
+    return 1
+  fi
+
+  current_record=$(echo "$get_record" | jq -r .result[0].id)
+  if [ -z "$current_record" ] || [ "$current_record" = "null" ]; then
+    log "ERROR" "DNS record for $domain ($record_type) not found in Cloudflare."
+    return 1
+  fi
+
+  attempt=1
+  success=false
+  while [ "$attempt" -le "$MAX_RETRIES" ]; do
+    update_result=$(curl -s --fail -X PUT "https://api.cloudflare.com/client/v4/zones/${zoneid}/dns_records/${current_record}" \
+      -H "Authorization: Bearer ${cf_token}" \
+      -H "Content-Type: application/json" \
+      --data "{\"type\":\"${record_type}\",\"name\":\"${domain}\",\"content\":\"${curr_ip}\",\"ttl\":${ttl},\"proxied\":${proxied}}")
+
+    if [ "$(echo "$update_result" | jq -r .success)" = "true" ]; then
+      success=true
+      break
+    else
+      log "WARN" "Attempt $attempt: Failed to update DNS record for $domain ($record_type). Retrying in $RETRY_DELAY seconds..."
+      sleep "$RETRY_DELAY"
+      attempt=$((attempt + 1))
+    fi
+  done
+
+  if [ "$success" = "true" ]; then
+    log "INFO" "DNS record for $domain ($record_type) updated successfully."
+    echo "$curr_ip" > "$ip_file"
+  else
+    log "ERROR" "All attempts failed to update DNS record for $domain ($record_type)."
+    return 1
+  fi
+}
+
+# Add a new domain configuration
+add_domain_config() {
+  domain="$1"
+  cf_token="$2"
+  zoneid="$3"
+  proxied="$4"
+  ttl="$5"
+
+  if [ -z "$domain" ] || [ -z "$cf_token" ] || [ -z "$zoneid" ]; then
+    echo "Error: Domain, CF Token, and Zone ID are required to add a new configuration."
+    exit 1
+  fi
+
+  if [ ! -f "$CONFIG_FILE" ]; then
+    echo '{"domains":[]}' > "$CONFIG_FILE"
+  fi
+
+  if jq -e --arg domain "$domain" '.domains[] | select(.domain==$domain)' "$CONFIG_FILE" >/dev/null; then
+    echo "Error: Domain '$domain' already exists in the configuration."
+    exit 1
+  fi
+
+  new_domain_config=$(jq -n \
+    --arg domain "$domain" \
+    --arg cf_token "$cf_token" \
+    --arg zoneid "$zoneid" \
+    --argjson proxied "$proxied" \
+    --arg ttl "$ttl" \
+    '{
+      domain: $domain,
+      cf_token: $cf_token,
+      zoneid: $zoneid,
+      proxied: $proxied,
+      ttl: ($ttl | tonumber)
+    }')
+
+  if jq --argjson newDomain "$new_domain_config" '.domains += [$newDomain]' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"; then
+    echo "Domain '$domain' added successfully to the configuration."
+  else
+    echo "Error: Failed to add the domain to the configuration."
+    exit 1
+  fi
+}
+
+##############################
+# Parse Command-Line Options
+##############################
+
+while getopts ":ac:d:z:t:T:pvh" opt; do
+  case $opt in
+    a)
+      ADD_CONFIG=true
+      ;;
+    c)
+      CONFIG_FILE="$OPTARG"
+      ;;
+    d)
+      SPECIFIC_DOMAIN="$OPTARG"
+      ;;
+    z)
+      ADD_ZONEID="$OPTARG"
+      ;;
+    t)
+      ADD_TOKEN="$OPTARG"
+      ;;
+    T)
+      ADD_TTL="$OPTARG"
+      ;;
+    p)
+      ADD_PROXIED=true
+      ;;
+    v)
+      VERBOSE=true
+      ;;
+    h)
+      show_help
+      ;;
+    \?)
+      echo "Invalid option: -$OPTARG" >&2
+      show_help
+      ;;
+    :)
+      echo "Option -$OPTARG requires an argument." >&2
+      show_help
+      ;;
+  esac
+done
+
+#############################
+# Main Execution Starts Here
+#############################
+
+if [ "$ADD_CONFIG" = true ]; then
+  add_domain_config "$SPECIFIC_DOMAIN" "$ADD_TOKEN" "$ADD_ZONEID" "$ADD_PROXIED" "$ADD_TTL"
+  exit 0
+fi
+
+if [ ! -f "$CONFIG_FILE" ]; then
+  echo "Configuration file not found at $CONFIG_FILE"
+  exit 1
+fi
+
+config_content=$(cat "$CONFIG_FILE")
+domains=$(echo "$config_content" | jq -r '.domains[] | @base64')
+
+if [ -z "$domains" ]; then
+  echo "No domains found in configuration file."
+  exit 1
+fi
+
+domain_found=false
+
+for domain_config in $domains; do
+  _jq() {
+    echo "$domain_config" | base64 --decode | jq -r "$1"
+  }
+
+  domain=$(_jq '.domain')
+  cf_token=$(_jq '.cf_token')
+  zoneid=$(_jq '.zoneid')
+  proxied=$(_jq '.proxied // false')
+  ttl=$(_jq '.ttl // 60')
+
+  if [ -z "$cf_token" ] || [ -z "$zoneid" ]; then
+    log "ERROR" "cf_token or zoneid not set for $domain."
+    continue
+  fi
+
+  if [ -n "$SPECIFIC_DOMAIN" ]; then
+    if [ "$domain" != "$SPECIFIC_DOMAIN" ]; then
+      continue
+    else
+      domain_found=true
+    fi
+  fi
+
+  update_domain "$domain" "$cf_token" "$zoneid" "$proxied" "$ttl"
+done
+
+if [ -n "$SPECIFIC_DOMAIN" ] && [ "$domain_found" = false ]; then
+  log "ERROR" "Specified domain '$SPECIFIC_DOMAIN' not found in the configuration file."
+  exit 1
+fi
+
