@@ -32,6 +32,37 @@ ADD_CONFIG=false
 ############################################
 ```
 
+### Example Config File
+Can be created / added to by script
+
+```
+{
+  "domains": [
+    {
+      "domain": "sub1.domain.tld",
+      "cf_token": "XXXXX",
+      "zoneid": "YYYYY",
+      "proxied": false,
+      "ttl": 60
+    },
+    {
+      "domain": "domain.tld",
+      "cf_token": "XXXXX",
+      "zoneid": "YYYYY",
+      "proxied": false,
+      "ttl": 90
+    },
+    {
+      "domain": "sub2.domain.tld",
+      "cf_token": "XXXXX",
+      "zoneid": "YYYYY",
+      "proxied": true,
+      "ttl": 120
+    }
+  ]
+}
+```
+
 ### Usage
 
 ```
