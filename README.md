@@ -16,8 +16,9 @@ Script checks for required dependencies, they are: curl, jq, flock, tail, mv, mk
 ############################################
 
 BASEDIR="$HOME/bin/cloudflare_ddns"
-CONFIG_FILE="$BASEDIR/.ddns_configs/ddns.conf"
-LOG_FILE="$BASEDIR/.ddns_configs/ddns.log"
+CONFDIR="$BASEDIR/.ddns_configs"
+CONFIG_FILE="$CONFDIR/ddns.conf"
+LOG_FILE="$CONFDIR/ddns.log"
 MAX_LOG_SIZE=200 #Lines
 IPV4_SERVICE="http://ipv4.icanhazip.com"
 IPV6_SERVICE="http://ipv6.icanhazip.com"
